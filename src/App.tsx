@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import { CHAIN, isAddr } from './lib/config'
 import { loadPositions } from './lib/positions'
-import { loadWalletPnL, WalletPnL } from './lib/pnl'
+import { fetchLpActivity, computeWalletPnL, WalletPnL } from './lib/pnl'
 import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
@@ -26,11 +26,16 @@ export default function App() {
     if (!isAddr(a)) { setStatus('Enter a valid 0x address'); return }
     setLoading(true); setData(null); setShowCard(false)
     try {
-      setStatus('Detecting positions…')
-      const positions = await loadPositions(a, (s, t, f) => setStatus(`Reading positions ${s}/${t} · ${f} found`))
-      if (!positions.length) { setStatus('No Uniswap V4 positions found for this address.'); setLoading(false); return }
-      setStatus(`Reconstructing PnL from ${positions.length} positions…`)
-      const pnl = await loadWalletPnL(a, positions)
+      // Positions (RPC reads) and history (Blockscout) are independent — fetch both
+      // at once so the two slow phases overlap instead of running back-to-back.
+      setStatus('Scanning positions + trade history…')
+      const [positions, activity] = await Promise.all([
+        loadPositions(a, (s, t, f) => setStatus(`Reading positions ${s}/${t} · ${f} found`)),
+        fetchLpActivity(a),
+      ])
+      if (!positions.length && !activity.lpTxs.length) { setStatus('No Uniswap V4 positions or LP activity found for this address.'); setLoading(false); return }
+      setStatus('Reconstructing PnL…')
+      const pnl = computeWalletPnL(a, positions, activity)
       setData(pnl); setStatus('')
     } catch (e: any) {
       setStatus('Error: ' + (e?.message || e))

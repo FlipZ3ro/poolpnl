@@ -122,8 +122,71 @@ export interface WalletPnL {
 
 const wei = (n: bigint) => Number(n) / 1e18
 
+interface Transfer { token: string; symbol: string; from: string; to: string; value: bigint }
+export interface LpActivity {
+  lpTxs: { hash: string; value: bigint; input: string; ts: number }[]
+  transfersByTx: Map<string, Transfer[]>
+  internalsByTx: Map<string, any[]>
+}
+
+// Fetch every Blockscout record PnL needs. Independent of on-chain position reads,
+// so the caller can run this in parallel with loadPositions() — the two slow,
+// unrelated phases (RPC reads ∥ indexer history) then overlap instead of stacking.
+export async function fetchLpActivity(owner: string): Promise<LpActivity> {
+  // 1) find LP txs by scanning the owner's tx calldata for the modifyLiquidities
+  //    selector. This pagination is cursor-based (sequential) and unavoidable.
+  const txItems = await bsPaged(`/addresses/${owner}/transactions?filter=from`, 30)
+  const seen = new Set<string>()
+  const lpTxs = txItems.filter((t) => {
+    const h = lc(t.hash); if (seen.has(h)) return false
+    const input = (t.raw_input || t.input || '').toLowerCase()
+    if (!input.includes(SEL)) return false
+    seen.add(h); return true
+  }).map((t) => ({
+    hash: t.hash as string,
+    value: BigInt(t.value || '0'),
+    input: (t.raw_input || t.input || '').toLowerCase(),
+    ts: Math.floor(new Date(t.timestamp).getTime() / 1000),
+  }))
+
+  // 2) this chain's indexer is ~4s/request, so paging the full address token-transfer
+  //    history (many sequential pages) dominates. We only need transfers for the LP
+  //    txs, so fetch native (internal-txns) + ERC20 (token-transfers) PER LP TX and
+  //    fan out with bounded concurrency — turning N sequential pages into ~⌈2N/12⌉
+  //    parallel rounds.
+  const transfersByTx = new Map<string, Transfer[]>()
+  const internalsByTx = new Map<string, any[]>()
+  const CONC = 12
+  for (let i = 0; i < lpTxs.length; i += CONC) {
+    const chunk = lpTxs.slice(i, i + CONC)
+    await Promise.all(chunk.map(async (tx) => {
+      const [intl, tt] = await Promise.all([
+        bsRetry(`/transactions/${tx.hash}/internal-transactions`),
+        bsRetry(`/transactions/${tx.hash}/token-transfers`),
+      ])
+      internalsByTx.set(lc(tx.hash), intl?.items || [])
+      const trs: Transfer[] = []
+      for (const x of (tt?.items || [])) {
+        trs.push({
+          token: lc(x.token?.address || x.token?.address_hash || ''),
+          symbol: x.token?.symbol || '',
+          from: lc(x.from?.hash || ''), to: lc(x.to?.hash || ''),
+          value: BigInt(x.total?.value || x.value || '0'),
+        })
+      }
+      transfersByTx.set(lc(tx.hash), trs)
+    }))
+  }
+  return { lpTxs, transfersByTx, internalsByTx }
+}
+
 export async function loadWalletPnL(owner: string, positions: Position[]): Promise<WalletPnL> {
+  return computeWalletPnL(owner, positions, await fetchLpActivity(owner))
+}
+
+export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity): WalletPnL {
   const ownerLc = lc(owner)
+  const { lpTxs, transfersByTx, internalsByTx } = act
   // price map: pair token → ETH per 1 token (raw/raw via sqrtPrice), from live pools
   const priceByToken = new Map<string, bigint>() // token → sqrtPriceX96
   const posByToken = new Map<string, Position[]>()
@@ -143,42 +206,7 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
     return { eth: currency1ToEth(amt, sp) / 1e18, priced: true }
   }
 
-  // 1) owner transactions → keep LP txs (calldata contains the modifyLiquidities selector)
-  const txItems = await bsPaged(`/addresses/${owner}/transactions?filter=from`, 30)
-  const seen = new Set<string>()
-  const lpTxs = txItems.filter((t) => {
-    const h = lc(t.hash); if (seen.has(h)) return false
-    const input = (t.raw_input || t.input || '').toLowerCase()
-    if (!input.includes(SEL)) return false
-    seen.add(h); return true
-  }).map((t) => ({
-    hash: t.hash as string,
-    value: BigInt(t.value || '0'),
-    input: (t.raw_input || t.input || '').toLowerCase(),
-    ts: Math.floor(new Date(t.timestamp).getTime() / 1000),
-  }))
-
-  // 2) owner ERC20 transfers grouped by tx (dedup by log)
-  const ttItems = await bsPaged(`/addresses/${owner}/token-transfers?type=ERC-20`, 30)
-  const transfersByTx = new Map<string, { token: string; symbol: string; from: string; to: string; value: bigint }[]>()
-  const tseen = new Set<string>()
-  for (const t of ttItems) {
-    const h = lc(t.transaction_hash || t.tx_hash || '')
-    if (!h) continue
-    const key = h + ':' + (t.log_index ?? Math.random())
-    if (tseen.has(key)) continue
-    tseen.add(key)
-    const tr = {
-      token: lc(t.token?.address || t.token?.address_hash || ''),
-      symbol: t.token?.symbol || '',
-      from: lc(t.from?.hash || ''), to: lc(t.to?.hash || ''),
-      value: BigInt(t.total?.value || t.value || '0'),
-    }
-    if (!transfersByTx.has(h)) transfersByTx.set(h, [])
-    transfersByTx.get(h)!.push(tr)
-  }
-
-  // 3) per LP tx: classify + read PoolManager cashflow, aggregate per pool
+  // classify + aggregate per pool
   const pools = new Map<string, PoolPnL>()
   const ensure = (token: string): PoolPnL => {
     if (!pools.has(token)) pools.set(token, {
@@ -189,19 +217,16 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
   }
   const calendar = new Map<string, number>()
 
-  const B = 6
-  for (let i = 0; i < lpTxs.length; i += B) {
-    const chunk = lpTxs.slice(i, i + B)
-    const internals = await Promise.all(chunk.map((t) => bsRetry(`/transactions/${t.hash}/internal-transactions`)))
-    chunk.forEach((tx, ci) => {
+  {
+    for (const tx of lpTxs) {
       const acts = lpActionsForTx(tx.input)
-      if (!acts.length) return
+      if (!acts.length) continue
       const isCollect = acts.some((a) => a.action === ACT.DECREASE && a.liquidity === 0n)
       const isRemove = acts.some((a) => (a.action === ACT.DECREASE && a.liquidity > 0n) || a.action === ACT.BURN)
       const isAdd = acts.some((a) => a.action === ACT.MINT || a.action === ACT.INCREASE)
 
       // native ETH vs PoolManager
-      const it = internals[ci]?.items || []
+      const it = internalsByTx.get(lc(tx.hash)) || []
       let natIn = tx.value // native sent with the tx (deposit)
       let natOut = 0n
       for (const x of it) {
@@ -244,7 +269,7 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
       }
       // deposits that weren't tagged isAdd (e.g. mint via router w/o decodable action) still count if only inflow
       if (!isAdd && !isCollect && !isRemove && ethIn > 0) { pool.cost += ethIn; pool.events.push({ ts: tx.ts, kind: 'add', eth: ethIn, hash: tx.hash }) }
-    })
+    }
   }
 
   // 4) merge live open positions (exact current value + unclaimed)
