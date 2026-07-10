@@ -4,9 +4,11 @@ const DOW = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 // Heat calendar of ETH flowing back to the wallet (removals + fee collects) per day.
-export function Calendar({ calendar }: { calendar: Map<string, number> }) {
+export function Calendar({ calendar, historyComplete = true }: { calendar: Map<string, number>; historyComplete?: boolean }) {
   if (calendar.size === 0) {
-    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--muted)', border: '1px solid var(--border-soft)', borderRadius: 13 }}>No realized flow yet — all positions still open.</div>
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--muted)', border: '1px solid var(--border-soft)', borderRadius: 13 }}>
+      {historyComplete ? 'No realized flow yet — all positions still open.' : 'Trade history unavailable (indexer truncated) — retry from the banner above.'}
+    </div>
   }
   const days = [...calendar.keys()].sort()
   const first = new Date(days[0] + 'T00:00:00Z')

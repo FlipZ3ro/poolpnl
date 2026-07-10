@@ -21,25 +21,30 @@ const WETHlc = lc(WETH)
 const isEthSide = (t: string) => t === WETHlc || /^0x0+$/.test(t)
 
 // ---- resilient Blockscout fetch ----------------------------------------------
-async function bsRetry(path: string, tries = 4): Promise<any> {
+// This chain's indexer is slow and returns 500s intermittently, so retry hard.
+async function bsRetry(path: string, tries = 6): Promise<any> {
   for (let i = 0; i < tries; i++) {
     try { const r = await fetch(`${CHAIN.blockscoutApi}${path}`); if (r.ok) return await r.json() } catch { /* retry */ }
-    await new Promise((r) => setTimeout(r, 250 * (i + 1)))
+    await new Promise((r) => setTimeout(r, 300 * (i + 1)))
   }
   return null
 }
-async function bsPaged(path: string, cap = 30): Promise<any[]> {
+// Paginate, reporting whether we saw the full history. `complete` is false if a
+// page failed after all retries or we hit the cap with more pages remaining — so
+// callers never mistake a truncated fetch for "no more data".
+async function bsPagedC(path: string, cap = 40): Promise<{ items: any[]; complete: boolean }> {
   const items: any[] = []
   let np: any = null
-  for (let p = 0; p < cap; p++) {
+  let p = 0
+  for (; p < cap; p++) {
     const sep = path.includes('?') ? '&' : '?'
     const res = await bsRetry(np ? `${path}${sep}${new URLSearchParams(np)}` : path)
-    if (!res) break
+    if (!res) return { items, complete: false } // a page genuinely failed → truncated
     items.push(...(res.items || []))
     np = res.next_page_params
-    if (!np) break
+    if (!np) return { items, complete: true }   // natural end of history
   }
-  return items
+  return { items, complete: !np }               // hit cap: complete only if no more pages
 }
 
 // ---- modifyLiquidities calldata decode ---------------------------------------
@@ -117,7 +122,8 @@ export interface WalletPnL {
     open: number; closed: number
   }
   calendar: Map<string, number>
-  approx: boolean        // any pool priced ETH-side only
+  approx: boolean         // any pool priced ETH-side only
+  historyComplete: boolean // false → indexer truncated history; realized/collected may be understated
 }
 
 const wei = (n: bigint) => Number(n) / 1e18
@@ -127,6 +133,7 @@ export interface LpActivity {
   lpTxs: { hash: string; value: bigint; input: string; ts: number }[]
   transfersByTx: Map<string, Transfer[]>
   internalsByTx: Map<string, any[]>
+  complete: boolean   // false if the indexer truncated the tx list or any per-tx fetch failed
 }
 
 // Fetch every Blockscout record PnL needs. Independent of on-chain position reads,
@@ -135,7 +142,7 @@ export interface LpActivity {
 export async function fetchLpActivity(owner: string): Promise<LpActivity> {
   // 1) find LP txs by scanning the owner's tx calldata for the modifyLiquidities
   //    selector. This pagination is cursor-based (sequential) and unavoidable.
-  const txItems = await bsPaged(`/addresses/${owner}/transactions?filter=from`, 30)
+  const { items: txItems, complete: txComplete } = await bsPagedC(`/addresses/${owner}/transactions?filter=from`, 40)
   const seen = new Set<string>()
   const lpTxs = txItems.filter((t) => {
     const h = lc(t.hash); if (seen.has(h)) return false
@@ -156,6 +163,7 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
   //    parallel rounds.
   const transfersByTx = new Map<string, Transfer[]>()
   const internalsByTx = new Map<string, any[]>()
+  let perTxFail = 0
   const CONC = 12
   for (let i = 0; i < lpTxs.length; i += CONC) {
     const chunk = lpTxs.slice(i, i + CONC)
@@ -164,6 +172,7 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
         bsRetry(`/transactions/${tx.hash}/internal-transactions`),
         bsRetry(`/transactions/${tx.hash}/token-transfers`),
       ])
+      if (intl == null || tt == null) perTxFail++ // a leg failed after all retries → this tx's flow is incomplete
       internalsByTx.set(lc(tx.hash), intl?.items || [])
       const trs: Transfer[] = []
       for (const x of (tt?.items || [])) {
@@ -177,7 +186,7 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
       transfersByTx.set(lc(tx.hash), trs)
     }))
   }
-  return { lpTxs, transfersByTx, internalsByTx }
+  return { lpTxs, transfersByTx, internalsByTx, complete: txComplete && perTxFail === 0 }
 }
 
 export async function loadWalletPnL(owner: string, positions: Position[]): Promise<WalletPnL> {
@@ -307,5 +316,5 @@ export function computeWalletPnL(owner: string, positions: Position[], act: LpAc
   t.realized = out.reduce((s, p) => s + (p.open > 0 ? (p.withdrawn + p.collectedFees - Math.min(p.cost, p.withdrawn + p.collectedFees)) : p.pnl), 0)
   t.unrealized = t.pnl - t.realized
   out.sort((a, b) => b.pnl - a.pnl)
-  return { address: owner, pools: out, totals: t, calendar, approx }
+  return { address: owner, pools: out, totals: t, calendar, approx, historyComplete: act.complete }
 }

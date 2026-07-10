@@ -90,6 +90,15 @@ export default function App() {
             <button onClick={() => setShowCard(true)} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--panel)', fontWeight: 600, fontSize: 13 }}>📸 Share PnL card</button>
           </div>
 
+          {!data.historyComplete && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', padding: '11px 15px', borderRadius: 11, border: '1px solid rgba(245,158,11,.35)', background: 'rgba(245,158,11,.08)', marginBottom: 14 }}>
+              <span style={{ fontSize: 13, color: 'var(--amber)' }}>
+                ⚠️ Trade history was truncated by the chain indexer — <b>deposited / realized / collected may be understated</b>. Current value &amp; unclaimed fees are exact.
+              </span>
+              <button onClick={() => run(data.address)} disabled={loading} style={{ padding: '7px 14px', borderRadius: 8, fontWeight: 700, fontSize: 12.5, background: 'var(--amber)', color: '#1a1206', whiteSpace: 'nowrap' }}>↻ Retry history</button>
+            </div>
+          )}
+
           {/* hero PnL */}
           <div style={{ padding: '22px 24px', borderRadius: 16, border: '1px solid var(--border)', background: 'linear-gradient(160deg,var(--panel),var(--panel-2))', marginBottom: 14 }}>
             <div style={{ fontSize: 12, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 600 }}>Total PnL</div>
@@ -122,7 +131,7 @@ export default function App() {
             ))}
           </div>
 
-          {tab === 'pools' ? <Pools data={data} /> : <Calendar calendar={data.calendar} />}
+          {tab === 'pools' ? <Pools data={data} /> : <Calendar calendar={data.calendar} historyComplete={data.historyComplete} />}
         </div>
       )}
 
