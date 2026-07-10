@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import { CHAIN, isAddr } from './lib/config'
 import { loadPositions } from './lib/positions'
-import { fetchLpActivity, computeWalletPnL, WalletPnL } from './lib/pnl'
+import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL } from './lib/pnl'
 import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
@@ -34,8 +34,11 @@ export default function App() {
         fetchLpActivity(a),
       ])
       if (!positions.length && !activity.lpTxs.length) { setStatus('No Uniswap V4 positions or LP activity found for this address.'); setLoading(false); return }
-      setStatus('Reconstructing PnL…')
-      const pnl = computeWalletPnL(a, positions, activity)
+      setStatus('Pricing tokens + reconstructing PnL…')
+      // resolve bonding-curve prices for every token we touched (positions + history)
+      const toks = [...positions.flatMap((p) => [p.token0.address, p.token1.address]), ...[...activity.transfersByTx.values()].flat().map((t) => t.token)]
+      const curve = await resolveCurvePrices(toks)
+      const pnl = computeWalletPnL(a, positions, activity, curve)
       setData(pnl); setStatus('')
     } catch (e: any) {
       setStatus('Error: ' + (e?.message || e))

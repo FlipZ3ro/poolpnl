@@ -17,6 +17,12 @@ export const NATIVE = '0x0000000000000000000000000000000000000000'
 export const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
 export const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168' // ~$1 stable, for ETH/USD
 
+// Launchpad bonding curve — origin & price source for launched tokens that haven't
+// "graduated" to a full V4 pool. currentPrice(token) → wei ETH per 1 whole token,
+// or 0 if the token isn't (or is no longer) on the curve.
+export const BONDING_CURVE = '0xd861cb5dc71a0171e8f0f6586cadb069f3a35e4d'
+export const CURVE_SEL = { currentPrice: '0xe9833c2f', quoteSell: '0xd98b2f5c' }
+
 export const PM_SEL = {
   balanceOf: '0x70a08231', ownerOf: '0x6352211e', nextTokenId: '0x75794a3c',
   getPoolAndPositionInfo: '0x7ba03aad', getPositionLiquidity: '0x1efeed33',

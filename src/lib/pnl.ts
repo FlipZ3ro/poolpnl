@@ -13,12 +13,26 @@
 //      current price. Live open positions add exact current value + unclaimed fees.
 // Blockscout on this chain load-balances inconsistent indexers, so every fetch
 // retries and results are de-duplicated by hash.
-import { CHAIN, POOL_MANAGER, lc, WETH } from './config'
+import { CHAIN, POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL } from './config'
 import { Position, currency1ToEth } from './positions'
+import { batchCall, hexToBig } from './rpc'
 
 const PM = lc(POOL_MANAGER)
 const WETHlc = lc(WETH)
 const isEthSide = (t: string) => t === WETHlc || /^0x0+$/.test(t)
+const E18 = 10n ** 18n
+
+// Query the launchpad bonding curve for the ETH price of each token (wei per whole
+// token). Tokens not on the curve return 0 → caller falls back to the V4 pool price.
+export async function resolveCurvePrices(tokens: string[]): Promise<Map<string, bigint>> {
+  const uniq = [...new Set(tokens.map(lc).filter((t) => t && !isEthSide(t)))]
+  const out = new Map<string, bigint>()
+  if (!uniq.length) return out
+  const padAddr = (a: string) => a.replace(/^0x/, '').padStart(64, '0')
+  const res = await batchCall(uniq.map((t) => ({ to: BONDING_CURVE, data: CURVE_SEL.currentPrice + padAddr(t) })))
+  res.forEach((r, i) => { const v = hexToBig(r); if (v > 0n) out.set(uniq[i], v) })
+  return out
+}
 
 // ---- resilient Blockscout fetch ----------------------------------------------
 // This chain's indexer is slow and returns 500s intermittently, so retry hard.
@@ -190,10 +204,13 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
 }
 
 export async function loadWalletPnL(owner: string, positions: Position[]): Promise<WalletPnL> {
-  return computeWalletPnL(owner, positions, await fetchLpActivity(owner))
+  const act = await fetchLpActivity(owner)
+  const toks = [...positions.flatMap((p) => [p.token0.address, p.token1.address]), ...[...act.transfersByTx.values()].flat().map((t) => t.token)]
+  const curve = await resolveCurvePrices(toks)
+  return computeWalletPnL(owner, positions, act, curve)
 }
 
-export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity): WalletPnL {
+export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity, curvePrice: Map<string, bigint> = new Map()): WalletPnL {
   const ownerLc = lc(owner)
   const { lpTxs, transfersByTx, internalsByTx } = act
   // price map: pair token → ETH per 1 token (raw/raw via sqrtPrice), from live pools
@@ -208,8 +225,12 @@ export function computeWalletPnL(owner: string, positions: Position[], act: LpAc
     if (!posByToken.has(pair)) posByToken.set(pair, [])
     posByToken.get(pair)!.push(p)
   }
+  // Value a raw token amount in ETH. Preference: bonding-curve price (accurate for
+  // launchpad tokens still on the curve) → V4 pool price → unpriced.
   const tokenToEth = (token: string, amt: bigint): { eth: number; priced: boolean } => {
     if (isEthSide(token)) return { eth: wei(amt), priced: true }
+    const cp = curvePrice.get(token) // wei ETH per whole token (18-dec launchpad tokens)
+    if (cp) return { eth: Number((amt * cp) / E18) / 1e18, priced: true }
     const sp = priceByToken.get(token)
     if (!sp) return { eth: 0, priced: false }
     return { eth: currency1ToEth(amt, sp) / 1e18, priced: true }
@@ -281,15 +302,25 @@ export function computeWalletPnL(owner: string, positions: Position[], act: LpAc
     }
   }
 
-  // 4) merge live open positions (exact current value + unclaimed)
+  // 4) merge live open positions (exact current value + unclaimed). The ETH side is
+  //    1:1; the pair side is valued via curve price (fallback: the pool's own sqrtPrice).
   for (const [token, list] of posByToken) {
     const pool = ensure(token)
     pool.positions = list
     for (const p of list) {
-      const cv = wei(p.amount0) + currency1ToEth(p.amount1, p.sqrtPriceX96) / 1e18
-      const uc = wei(p.fee0) + currency1ToEth(p.fee1, p.sqrtPriceX96) / 1e18
-      pool.currentValue += cv
-      pool.unclaimed += uc
+      const t0Eth = isEthSide(lc(p.token0.address))
+      const ethAmt = t0Eth ? p.amount0 : p.amount1
+      const ethFee = t0Eth ? p.fee0 : p.fee1
+      const pairAmt = t0Eth ? p.amount1 : p.amount0
+      const pairFee = t0Eth ? p.fee1 : p.fee0
+      // if pair token isn't on the curve, fall back to the pool's sqrtPrice valuation
+      const valPair = (amt: bigint): number => {
+        const cp = curvePrice.get(token)
+        if (cp) return Number((amt * cp) / E18) / 1e18
+        return t0Eth ? currency1ToEth(amt, p.sqrtPriceX96) / 1e18 : (p.sqrtPriceX96 ? (Number(amt) * Number(p.sqrtPriceX96) * Number(p.sqrtPriceX96)) / Number(1n << 192n) / 1e18 : 0)
+      }
+      pool.currentValue += wei(ethAmt) + valPair(pairAmt)
+      pool.unclaimed += wei(ethFee) + valPair(pairFee)
       if (p.liquidity > 0n) pool.open++
     }
   }
