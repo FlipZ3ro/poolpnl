@@ -186,18 +186,87 @@ export async function readPosition(tokenId: number): Promise<Position | null> {
   }
 }
 
-/** Detect (Blockscout, else ownerOf scan) + read all positions for any address. */
+const tick2c = (t: number) => pad(t < 0 ? (BigInt(t) + U256) % U256 : t)
+function metaOf(addr: string): TokenMeta {
+  if (/^0x0+$/.test(addr)) return { address: NATIVE, symbol: 'ETH', decimals: 18 }
+  return metaCache.get(lc(addr)) || { address: lc(addr), symbol: addr.slice(0, 6), decimals: 18 }
+}
+
+/** Detect (Blockscout, else ownerOf scan) + read all positions for any address.
+ *  Reads are BATCHED across positions: each chunk needs only ~2 JSON-RPC batch
+ *  round-trips (state, then fees+token metadata) instead of ~8 HTTP calls per
+ *  position — the difference between ~100 requests and a handful. */
 export async function loadPositions(owner: string, onProgress?: (s: number, t: number, f: number) => void): Promise<Position[]> {
   let ids: number[] = []
   try { ids = await detectViaBlockscout(owner) } catch { /* fall back below */ }
   if (ids.length === 0) ids = await detectTokenIds(owner, onProgress)
   const out: Position[] = []
-  const B = 8
-  for (let i = 0; i < ids.length; i += B) {
-    const chunk = ids.slice(i, i + B)
-    const res = await Promise.all(chunk.map((id) => readPosition(id).catch(() => null)))
-    for (const p of res) if (p) out.push(p)
-    onProgress?.(Math.min(i + B, ids.length), ids.length, out.length)
+  const CH = 16 // keep each JSON-RPC batch comfortably under the RPC's ~100-call cap
+  for (let c = 0; c < ids.length; c += CH) {
+    const chunk = ids.slice(c, c + CH)
+
+    // WAVE 1 — pool/position info + liquidity for every tokenId
+    const w1 = chunk.flatMap((id) => [
+      { to: V4.positionManager, data: PM_SEL.getPoolAndPositionInfo + pad(id) },
+      { to: V4.positionManager, data: PM_SEL.getPositionLiquidity + pad(id) },
+    ])
+    const r1 = await batchCall(w1)
+    const parsed: { tokenId: number; poolKey: PoolKey; poolId: string; tickLower: number; tickUpper: number; liquidity: bigint }[] = []
+    const tokens = new Set<string>()
+    chunk.forEach((id, i) => {
+      const gpi = r1[i * 2]; if (!gpi || gpi === '0x') return
+      const w = gpi.slice(2).match(/.{64}/g)!
+      const poolKey: PoolKey = {
+        currency0: ('0x' + w[0].slice(24)) as Address, currency1: ('0x' + w[1].slice(24)) as Address,
+        fee: parseInt(w[2], 16), tickSpacing: sgn24(parseInt(w[3].slice(-6), 16)), hooks: ('0x' + w[4].slice(24)) as Address,
+      }
+      const info = BigInt('0x' + w[5])
+      const tickLower = sgn24(Number((info >> 8n) & 0xffffffn))
+      const tickUpper = sgn24(Number((info >> 32n) & 0xffffffn))
+      parsed.push({ tokenId: id, poolKey, poolId: derivePoolId(poolKey), tickLower, tickUpper, liquidity: hexToBig(r1[i * 2 + 1]) })
+      tokens.add(lc(poolKey.currency0)); tokens.add(lc(poolKey.currency1))
+    })
+
+    // WAVE 2 — slot0 + fee-growth per position, plus symbol/decimals for new tokens
+    const needMeta = [...tokens].filter((t) => !/^0x0+$/.test(t) && !metaCache.has(lc(t)))
+    const w2: { to: string; data: string }[] = []
+    for (const p of parsed) {
+      const positionKey = keccak256(encodePacked(
+        ['address', 'int24', 'int24', 'bytes32'],
+        [V4.positionManager as Address, p.tickLower, p.tickUpper, ('0x' + pad(p.tokenId)) as `0x${string}`],
+      ))
+      w2.push({ to: V4.stateView, data: SV_SEL.getSlot0 + p.poolId.slice(2) })
+      w2.push({ to: V4.stateView, data: SV_SEL.getPositionInfo + p.poolId.slice(2) + positionKey.slice(2) })
+      w2.push({ to: V4.stateView, data: SV_SEL.getFeeGrowthInside + p.poolId.slice(2) + tick2c(p.tickLower) + tick2c(p.tickUpper) })
+    }
+    const metaBase = w2.length
+    for (const t of needMeta) { w2.push({ to: t, data: ERC20_SEL.symbol }); w2.push({ to: t, data: ERC20_SEL.decimals }) }
+    const r2 = await batchCall(w2)
+    needMeta.forEach((t, k) => {
+      const s = r2[metaBase + 2 * k], d = r2[metaBase + 2 * k + 1]
+      metaCache.set(lc(t), { address: lc(t), symbol: decStr(s) || t.slice(0, 6), decimals: d && d !== '0x' ? parseInt(d, 16) : 18 })
+    })
+
+    parsed.forEach((p, j) => {
+      const slot0 = r2[j * 3], posInfo = r2[j * 3 + 1], growth = r2[j * 3 + 2]
+      let sqrtPriceX96 = 0n, currentTick = 0
+      if (slot0 && slot0 !== '0x') { const s = slot0.slice(2).match(/.{64}/g)!; sqrtPriceX96 = BigInt('0x' + s[0]); currentTick = sgn24(parseInt(s[1].slice(-6), 16)) }
+      let amount0 = 0n, amount1 = 0n
+      if (p.liquidity > 0n && sqrtPriceX96 > 0n) [amount0, amount1] = amountsFromLiquidity(p.liquidity, sqrtPriceX96, sqrtAtTick(p.tickLower), sqrtAtTick(p.tickUpper))
+      let fee0 = 0n, fee1 = 0n
+      if (posInfo && growth && posInfo !== '0x' && growth !== '0x') {
+        const pw = posInfo.slice(2).match(/.{64}/g)!, gw = growth.slice(2).match(/.{64}/g)!
+        const posLiq = BigInt('0x' + pw[0])
+        fee0 = feeOwed(posLiq, BigInt('0x' + gw[0]), BigInt('0x' + pw[1]))
+        fee1 = feeOwed(posLiq, BigInt('0x' + gw[1]), BigInt('0x' + pw[2]))
+      }
+      out.push({
+        tokenId: p.tokenId, poolKey: p.poolKey, poolId: p.poolId, tickLower: p.tickLower, tickUpper: p.tickUpper,
+        liquidity: p.liquidity, currentTick, sqrtPriceX96, inRange: currentTick >= p.tickLower && currentTick < p.tickUpper,
+        token0: metaOf(p.poolKey.currency0), token1: metaOf(p.poolKey.currency1), amount0, amount1, fee0, fee1,
+      })
+    })
+    onProgress?.(Math.min(c + CH, ids.length), ids.length, out.length)
   }
   out.sort((a, b) => b.tokenId - a.tokenId)
   return out
