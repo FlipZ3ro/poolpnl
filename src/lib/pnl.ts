@@ -226,7 +226,8 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
       }
 
       const pool = ensure(pairToken)
-      if (!pool.symbol) pool.symbol = symByToken.get(pairToken) || pairToken.slice(0, 6)
+      if (!pairToken) { pool.symbol = 'Unknown pair'; pool.hasPrice = false }
+      else if (!pool.symbol) pool.symbol = symByToken.get(pairToken) || pairToken.slice(0, 6)
       const vIn = tokenToEth(pairToken, tokIn)
       const vOut = tokenToEth(pairToken, tokOut)
       if (!vIn.priced || !vOut.priced) pool.hasPrice = false

@@ -21,7 +21,7 @@ function Row({ p }: { p: PoolPnL }) {
     <div style={{ padding: '14px 16px', borderRadius: 13, border: '1px solid var(--border)', background: 'var(--panel)' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>ETH / {p.symbol || 'token'}</span>
+          <span style={{ fontWeight: 700, fontSize: 15 }}>{p.token ? `ETH / ${p.symbol || 'token'}` : 'Unindexed flow'}</span>
           {openBadge
             ? <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--green)', background: 'rgba(52,211,153,.12)', padding: '2px 9px', borderRadius: 20 }}>{p.open} open</span>
             : <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', background: 'var(--border-soft)', padding: '2px 9px', borderRadius: 20 }}>closed</span>}
