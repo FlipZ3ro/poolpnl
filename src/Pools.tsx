@@ -2,11 +2,13 @@ import { CHAIN } from './lib/config'
 import { WalletPnL, PoolPnL } from './lib/pnl'
 import { fmtEth, signEth } from './App'
 
-export function Pools({ data }: { data: WalletPnL }) {
+export function Pools({ data, loadingHistory }: { data: WalletPnL; loadingHistory?: boolean }) {
+  // While history loads we only know live pools; hide closed-only + history fields.
+  const rows = loadingHistory ? data.pools.filter((p) => p.open > 0 || p.currentValue > 1e-9) : data.pools
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-      {data.pools.map((p) => <Row key={p.token || 'eth'} p={p} />)}
-      {data.approx && (
+      {rows.map((p) => <Row key={p.token || 'eth'} p={p} loadingHistory={loadingHistory} />)}
+      {data.approx && !loadingHistory && (
         <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
           * Pools without a live position are priced ETH-side only; PnL there is approximate.
         </div>
@@ -15,7 +17,7 @@ export function Pools({ data }: { data: WalletPnL }) {
   )
 }
 
-function Row({ p }: { p: PoolPnL }) {
+function Row({ p, loadingHistory }: { p: PoolPnL; loadingHistory?: boolean }) {
   const openBadge = p.open > 0
   return (
     <div style={{ padding: '14px 16px', borderRadius: 13, border: '1px solid var(--border)', background: 'var(--panel)' }}>
@@ -32,14 +34,18 @@ function Row({ p }: { p: PoolPnL }) {
       <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginTop: 11, gap: 12, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', gap: 18, fontSize: 12, color: 'var(--muted-2)', flexWrap: 'wrap' }}>
           {p.currentValue > 1e-9 && <Field k="Value" v={fmtEth(p.currentValue)} />}
-          {p.cost > 1e-9 && <Field k="Deposited" v={fmtEth(p.cost)} />}
-          {p.withdrawn > 1e-9 && <Field k="Withdrawn" v={fmtEth(p.withdrawn)} />}
+          {!loadingHistory && p.cost > 1e-9 && <Field k="Deposited" v={fmtEth(p.cost)} />}
+          {!loadingHistory && p.withdrawn > 1e-9 && <Field k="Withdrawn" v={fmtEth(p.withdrawn)} />}
           {p.unclaimed > 1e-9 && <Field k="Unclaimed" v={fmtEth(p.unclaimed)} accent />}
-          {p.collectedFees > 1e-9 && <Field k="Collected" v={fmtEth(p.collectedFees)} accent />}
+          {!loadingHistory && p.collectedFees > 1e-9 && <Field k="Collected" v={fmtEth(p.collectedFees)} accent />}
         </div>
-        <div className={p.pnl >= 0 ? 'pos' : 'neg'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, fontSize: 18 }}>
-          {signEth(p.pnl)}<span style={{ fontSize: 11, opacity: 0.6, marginLeft: 3 }}>ETH</span>
-        </div>
+        {loadingHistory ? (
+          <div className="mono" style={{ color: 'var(--muted)', fontWeight: 800, fontSize: 18, animation: 'pulse 1.2s infinite' }}>···</div>
+        ) : (
+          <div className={p.pnl >= 0 ? 'pos' : 'neg'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, fontSize: 18 }}>
+            {signEth(p.pnl)}<span style={{ fontSize: 11, opacity: 0.6, marginLeft: 3 }}>ETH</span>
+          </div>
+        )}
       </div>
     </div>
   )

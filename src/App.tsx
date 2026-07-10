@@ -1,10 +1,12 @@
 import { useState, useCallback } from 'react'
 import { CHAIN, isAddr } from './lib/config'
 import { loadPositions } from './lib/positions'
-import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL } from './lib/pnl'
+import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL, LpActivity } from './lib/pnl'
 import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
+
+const EMPTY_ACTIVITY: LpActivity = { lpTxs: [], transfersByTx: new Map(), internalsByTx: new Map(), complete: true }
 
 const short = (a: string) => a.slice(0, 6) + '…' + a.slice(-4)
 export const fmtEth = (n: number, dp = 4) => {
@@ -18,31 +20,40 @@ export default function App() {
   const [status, setStatus] = useState('')
   const [loading, setLoading] = useState(false)
   const [data, setData] = useState<WalletPnL | null>(null)
+  const [loadingHistory, setLoadingHistory] = useState(false)
   const [tab, setTab] = useState<'pools' | 'calendar'>('pools')
   const [showCard, setShowCard] = useState(false)
 
   const run = useCallback(async (address: string) => {
     const a = address.trim()
     if (!isAddr(a)) { setStatus('Enter a valid 0x address'); return }
-    setLoading(true); setData(null); setShowCard(false)
+    setLoading(true); setData(null); setShowCard(false); setLoadingHistory(false)
     try {
-      // Positions (RPC reads) and history (Blockscout) are independent — fetch both
-      // at once so the two slow phases overlap instead of running back-to-back.
-      setStatus('Scanning positions + trade history…')
-      const [positions, activity] = await Promise.all([
-        loadPositions(a, (s, t, f) => setStatus(`Reading positions ${s}/${t} · ${f} found`)),
-        fetchLpActivity(a),
-      ])
-      if (!positions.length && !activity.lpTxs.length) { setStatus('No Uniswap V4 positions or LP activity found for this address.'); setLoading(false); return }
-      setStatus('Pricing tokens + reconstructing PnL…')
-      // resolve bonding-curve prices for every token we touched (positions + history)
+      // Kick off the slow history fetch (indexer) in the background right away…
+      const activityP = fetchLpActivity(a)
+      // …but read positions first (fast, batched) and render them immediately so the
+      // user sees current value + unclaimed fees in ~2s instead of waiting on history.
+      setStatus('Reading your positions…')
+      const positions = await loadPositions(a, (s, t, f) => setStatus(`Reading positions ${s}/${t} · ${f} found`))
+
+      if (positions.length) {
+        const curve0 = await resolveCurvePrices(positions.flatMap((p) => [p.token0.address, p.token1.address]))
+        setData(computeWalletPnL(a, positions, EMPTY_ACTIVITY, curve0)) // positions-only view
+        setLoadingHistory(true); setStatus('')
+      } else {
+        setStatus('Loading trade history…')
+      }
+
+      // Bring in trade history (realized / collected / calendar) when it arrives.
+      const activity = await activityP
+      if (!positions.length && !activity.lpTxs.length) { setStatus('No Uniswap V4 positions or LP activity found for this address.'); return }
       const toks = [...positions.flatMap((p) => [p.token0.address, p.token1.address]), ...[...activity.transfersByTx.values()].flat().map((t) => t.token)]
       const curve = await resolveCurvePrices(toks)
-      const pnl = computeWalletPnL(a, positions, activity, curve)
-      setData(pnl); setStatus('')
+      setData(computeWalletPnL(a, positions, activity, curve))
+      setStatus('')
     } catch (e: any) {
       setStatus('Error: ' + (e?.message || e))
-    } finally { setLoading(false) }
+    } finally { setLoading(false); setLoadingHistory(false) }
   }, [])
 
   const t = data?.totals
@@ -93,7 +104,14 @@ export default function App() {
             <button onClick={() => setShowCard(true)} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--panel)', fontWeight: 600, fontSize: 13 }}>📸 Share PnL card</button>
           </div>
 
-          {!data.historyComplete && (
+          {loadingHistory && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 15px', borderRadius: 11, border: '1px solid rgba(94,234,212,.3)', background: 'var(--accent-dim)', marginBottom: 14 }}>
+              <span style={{ animation: 'pulse 1.2s infinite' }}>⏳</span>
+              <span style={{ fontSize: 13, color: 'var(--accent)' }}>Positions &amp; unclaimed fees are ready — reconstructing <b>realized PnL, collected fees &amp; calendar</b> from trade history…</span>
+            </div>
+          )}
+
+          {!loadingHistory && !data.historyComplete && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', padding: '11px 15px', borderRadius: 11, border: '1px solid rgba(245,158,11,.35)', background: 'rgba(245,158,11,.08)', marginBottom: 14 }}>
               <span style={{ fontSize: 13, color: 'var(--amber)' }}>
                 ⚠️ Trade history was truncated by the chain indexer — <b>deposited / realized / collected may be understated</b>. Current value &amp; unclaimed fees are exact.
@@ -104,23 +122,23 @@ export default function App() {
 
           {/* hero PnL */}
           <div style={{ padding: '22px 24px', borderRadius: 16, border: '1px solid var(--border)', background: 'linear-gradient(160deg,var(--panel),var(--panel-2))', marginBottom: 14 }}>
-            <div style={{ fontSize: 12, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 600 }}>Total PnL</div>
+            <div style={{ fontSize: 12, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 600 }}>{loadingHistory ? 'Open value + unclaimed' : 'Total PnL'}</div>
             <div className={t.pnl >= 0 ? 'pos' : 'neg'} style={{ fontSize: 40, fontWeight: 800, letterSpacing: -1, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
               {signEth(t.pnl)} <span style={{ fontSize: 20, opacity: 0.7 }}>ETH</span>
             </div>
             <div style={{ display: 'flex', gap: 20, marginTop: 12, flexWrap: 'wrap', fontSize: 13 }}>
-              <span style={{ color: 'var(--muted-2)' }}>{t.open} open · {t.closed} closed</span>
-              <span style={{ color: 'var(--muted-2)' }}>Deposited <b className="mono">{fmtEth(t.deposited)}</b></span>
+              <span style={{ color: 'var(--muted-2)' }}>{t.open} open · {loadingHistory ? '…' : t.closed} closed</span>
+              <span style={{ color: 'var(--muted-2)' }}>Deposited <b className="mono">{loadingHistory ? '…' : fmtEth(t.deposited)}</b></span>
               <span style={{ color: 'var(--muted-2)' }}>Current value <b className="mono">{fmtEth(t.currentValue)}</b></span>
             </div>
           </div>
 
           {/* stat grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12, marginBottom: 22 }}>
-            <Stat label="Realized" v={t.realized} sign />
-            <Stat label="Unrealized" v={t.unrealized} sign />
+            <Stat label="Realized" v={t.realized} sign loading={loadingHistory} />
+            <Stat label="Unrealized" v={t.unrealized} sign loading={loadingHistory} />
             <Stat label="Unclaimed fees" v={t.unclaimed} accent />
-            <Stat label="Collected fees" v={t.collectedFees} accent />
+            <Stat label="Collected fees" v={t.collectedFees} accent loading={loadingHistory} />
           </div>
 
           {/* tabs */}
@@ -134,7 +152,7 @@ export default function App() {
             ))}
           </div>
 
-          {tab === 'pools' ? <Pools data={data} /> : <Calendar calendar={data.calendar} historyComplete={data.historyComplete} />}
+          {tab === 'pools' ? <Pools data={data} loadingHistory={loadingHistory} /> : <Calendar calendar={data.calendar} historyComplete={data.historyComplete} loadingHistory={loadingHistory} />}
         </div>
       )}
 
@@ -151,14 +169,18 @@ export default function App() {
   )
 }
 
-function Stat({ label, v, sign, accent }: { label: string; v: number; sign?: boolean; accent?: boolean }) {
+function Stat({ label, v, sign, accent, loading }: { label: string; v: number; sign?: boolean; accent?: boolean; loading?: boolean }) {
   const cls = accent ? '' : v >= 0 ? 'pos' : 'neg'
   return (
     <div style={{ padding: '15px 17px', borderRadius: 13, border: '1px solid var(--border)', background: 'var(--panel)' }}>
       <div style={{ fontSize: 11.5, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: 0.6, fontWeight: 600 }}>{label}</div>
-      <div className={cls} style={{ fontSize: 21, fontWeight: 800, marginTop: 5, fontFamily: 'var(--font-mono)', color: accent ? 'var(--accent)' : undefined }}>
-        {sign ? signEth(v) : fmtEth(v)}<span style={{ fontSize: 12, opacity: 0.6, marginLeft: 3 }}>ETH</span>
-      </div>
+      {loading ? (
+        <div style={{ fontSize: 21, fontWeight: 800, marginTop: 5, fontFamily: 'var(--font-mono)', color: 'var(--muted)', animation: 'pulse 1.2s infinite' }}>···</div>
+      ) : (
+        <div className={cls} style={{ fontSize: 21, fontWeight: 800, marginTop: 5, fontFamily: 'var(--font-mono)', color: accent ? 'var(--accent)' : undefined }}>
+          {sign ? signEth(v) : fmtEth(v)}<span style={{ fontSize: 12, opacity: 0.6, marginLeft: 3 }}>ETH</span>
+        </div>
+      )}
     </div>
   )
 }
