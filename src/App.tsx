@@ -6,7 +6,7 @@ import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
 
-const EMPTY_ACTIVITY: LpActivity = { lpTxs: [], transfersByTx: new Map(), internalsByTx: new Map(), complete: true }
+const EMPTY_ACTIVITY: LpActivity = { lpTxs: [], transfersByTx: new Map(), nativeByTx: new Map(), complete: true }
 
 const short = (a: string) => a.slice(0, 6) + '…' + a.slice(-4)
 export const fmtEth = (n: number, dp = 4) => {

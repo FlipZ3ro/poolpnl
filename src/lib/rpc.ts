@@ -30,30 +30,9 @@ export async function rpc(method: string, params: unknown[] = []): Promise<any> 
   return viaFetch(method, params)
 }
 
-/** Batched eth_call over one HTTP request. Falls back to parallel provider calls. */
-export async function batchCall(calls: { to: string; data: string }[]): Promise<(string | null)[]> {
-  if (!calls.length) return []
-  // try a JSON-RPC batch via the proxy first (fast; works on the deployed site)
-  try {
-    const body = calls.map((c, i) => ({ jsonrpc: '2.0', id: i + 1, method: 'eth_call', params: [{ to: c.to, data: c.data }, 'latest'] }))
-    const res = await fetch(FETCH_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    if (res.ok) {
-      const arr = await res.json()
-      if (Array.isArray(arr)) {
-        const out = new Array(calls.length).fill(null)
-        for (const r of arr) out[r.id - 1] = r.error ? null : r.result
-        return out
-      }
-    }
-  } catch { /* fall through */ }
-  // fallback: parallel single calls via provider (slower; works locally with wallet)
-  return Promise.all(calls.map((c) => rpc('eth_call', [{ to: c.to, data: c.data }, 'latest']).catch(() => null)))
-}
-
-/** Batched arbitrary JSON-RPC over one HTTP request (e.g. eth_getTransactionByHash,
- *  eth_getBlockByNumber). Returns results in order; null for any that errored. */
-export async function batchRpc(reqs: { method: string; params: unknown[] }[]): Promise<(any | null)[]> {
-  if (!reqs.length) return []
+// The public RPC rejects very large JSON-RPC batches, so split into ≤90-call chunks.
+const BATCH_MAX = 90
+async function oneBatch(reqs: { method: string; params: unknown[] }[]): Promise<(any | null)[]> {
   try {
     const body = reqs.map((r, i) => ({ jsonrpc: '2.0', id: i + 1, method: r.method, params: r.params }))
     const res = await fetch(FETCH_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -67,6 +46,20 @@ export async function batchRpc(reqs: { method: string; params: unknown[] }[]): P
     }
   } catch { /* fall through */ }
   return Promise.all(reqs.map((r) => rpc(r.method, r.params).catch(() => null)))
+}
+
+/** Batched arbitrary JSON-RPC, chunked under the RPC's batch-size cap. */
+export async function batchRpc(reqs: { method: string; params: unknown[] }[]): Promise<(any | null)[]> {
+  if (!reqs.length) return []
+  if (reqs.length <= BATCH_MAX) return oneBatch(reqs)
+  const out: (any | null)[] = []
+  for (let i = 0; i < reqs.length; i += BATCH_MAX) out.push(...await oneBatch(reqs.slice(i, i + BATCH_MAX)))
+  return out
+}
+
+/** Batched eth_call, chunked under the RPC's batch-size cap. */
+export async function batchCall(calls: { to: string; data: string }[]): Promise<(string | null)[]> {
+  return batchRpc(calls.map((c) => ({ method: 'eth_call', params: [{ to: c.to, data: c.data }, 'latest'] }))) as Promise<(string | null)[]>
 }
 
 export const ethCall = (to: string, data: string) => rpc('eth_call', [{ to, data }, 'latest'])

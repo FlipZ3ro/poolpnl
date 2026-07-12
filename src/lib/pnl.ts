@@ -13,7 +13,7 @@
 //      current price. Live open positions add exact current value + unclaimed fees.
 // Blockscout on this chain load-balances inconsistent indexers, so every fetch
 // retries and results are de-duplicated by hash.
-import { CHAIN, POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL, ERC20_SEL } from './config'
+import { POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL, ERC20_SEL } from './config'
 import { Position, currency1ToEth } from './positions'
 import { batchCall, batchRpc, rpc, hexToBig } from './rpc'
 
@@ -48,15 +48,6 @@ export async function resolveCurvePrices(tokens: string[]): Promise<Map<string, 
   return out
 }
 
-// ---- resilient Blockscout fetch ----------------------------------------------
-// This chain's indexer is slow and returns 500s intermittently, so retry hard.
-async function bsRetry(path: string, tries = 6): Promise<any> {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(`${CHAIN.blockscoutApi}${path}`); if (r.ok) return await r.json() } catch { /* retry */ }
-    await new Promise((r) => setTimeout(r, 300 * (i + 1)))
-  }
-  return null
-}
 // ---- modifyLiquidities calldata decode ---------------------------------------
 const SEL = 'dd46508f'
 const ACT = { INCREASE: 0x00, DECREASE: 0x01, MINT: 0x02, BURN: 0x03 }
@@ -142,8 +133,8 @@ interface Transfer { token: string; symbol: string; from: string; to: string; va
 export interface LpActivity {
   lpTxs: { hash: string; value: bigint; input: string; ts: number }[]
   transfersByTx: Map<string, Transfer[]>
-  internalsByTx: Map<string, any[]>
-  complete: boolean   // false if the indexer truncated the tx list or any per-tx fetch failed
+  nativeByTx: Map<string, bigint>   // signed net native ETH flow for the owner in the tx (+ = received)
+  complete: boolean
 }
 
 // Reconstruct LP history primarily from eth_getLogs (reliable on this chain, unlike
@@ -154,9 +145,10 @@ export interface LpActivity {
 // native, which isn't logged and this node exposes no trace) is the one piece still
 // read from Blockscout internal-txns — best-effort, and only for LP txs.
 export async function fetchLpActivity(owner: string): Promise<LpActivity> {
+  const ownerLc = lc(owner)
   const ot = topicAddr(owner)
   const head = Number(hexToBig(await rpc('eth_blockNumber', []).catch(() => '0x0')))
-  if (!head) return { lpTxs: [], transfersByTx: new Map(), internalsByTx: new Map(), complete: false }
+  if (!head) return { lpTxs: [], transfersByTx: new Map(), nativeByTx: new Map(), complete: false }
 
   // 1) all ERC20 transfers involving the owner (reliable, full history)
   const [toLogs, fromLogs] = await Promise.all([
@@ -180,51 +172,52 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
     if (from === PM || to === PM) { lpHashes.add(h); tokens.add(tr.token) } // LP: PoolManager is the counterparty
   }
 
-  // 2) calldata + native-in + block for each candidate LP tx (batched, reliable)
+  // 2) calldata + sender + block for each candidate LP tx (batched)
   const hashes = [...lpHashes]
   const txRes = await batchRpc(hashes.map((h) => ({ method: 'eth_getTransactionByHash', params: [h] })))
-  const blocks = new Set<number>()
   const cand = hashes.map((h, i) => {
     const t = txRes[i]; if (!t) return null
-    const block = Number(hexToBig(t.blockNumber))
-    blocks.add(block)
-    return { hash: h, value: hexToBig(t.value), input: (t.input || '').toLowerCase(), block, ts: 0 }
-  }).filter(Boolean) as { hash: string; value: bigint; input: string; block: number; ts: number }[]
-
-  const blkList = [...blocks]
-  const blkRes = await batchRpc(blkList.map((b) => ({ method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), false] })))
-  const tsByBlock = new Map<number, number>()
-  blkList.forEach((b, i) => { if (blkRes[i]) tsByBlock.set(b, Number(hexToBig(blkRes[i].timestamp))) })
-
+    return { hash: h, from: lc(t.from || ''), input: (t.input || '').toLowerCase(), block: Number(hexToBig(t.blockNumber)), ts: 0 }
+  }).filter(Boolean) as { hash: string; from: string; input: string; block: number; ts: number }[]
   // keep only true LP ops (modifyLiquidities selector present) — excludes swaps
-  const lpTxs = cand.filter((t) => t.input.includes(SEL)).map((t) => ({ hash: t.hash, value: t.value, input: t.input, ts: tsByBlock.get(t.block) || 0 }))
+  const lp = cand.filter((t) => t.input.includes(SEL))
 
-  // 3) symbols for every pair token (batched eth_call) — so closed-only pools show names
+  // 3) native ETH flow via BALANCE DELTA (all-RPC, archive node) — V4 pays native which
+  //    isn't logged and this node has no trace method; the owner's balance change across
+  //    the tx's block (adding back gas if the owner signed it) is the net native flow,
+  //    and it correctly captures multi-hop native the log/internal-tx view misses.
+  const need = new Set<number>()
+  for (const t of lp) { need.add(t.block); need.add(t.block - 1) }
+  const blkTs = [...new Set(lp.map((t) => t.block))]
+  const [balList, tsRes, rcRes] = await Promise.all([
+    batchRpc([...need].map((b) => ({ method: 'eth_getBalance', params: [owner, '0x' + b.toString(16)] }))),
+    batchRpc(blkTs.map((b) => ({ method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), false] }))),
+    batchRpc(lp.filter((t) => t.from === ownerLc).map((t) => ({ method: 'eth_getTransactionReceipt', params: [t.hash] }))),
+  ])
+  const balAt = new Map<number, bigint>(); [...need].forEach((b, i) => balAt.set(b, hexToBig(balList[i])))
+  const tsByBlock = new Map<number, number>(); blkTs.forEach((b, i) => { if (tsRes[i]) tsByBlock.set(b, Number(hexToBig(tsRes[i].timestamp))) })
+  const gasByTx = new Map<string, bigint>()
+  lp.filter((t) => t.from === ownerLc).forEach((t, i) => { const rc = rcRes[i]; if (rc) gasByTx.set(t.hash, hexToBig(rc.gasUsed) * hexToBig(rc.effectiveGasPrice || '0x0')) })
+  // one balance delta per block (attribute to the block's first LP tx to avoid double-count)
+  const byBlock = new Map<number, typeof lp>()
+  for (const t of lp) { if (!byBlock.has(t.block)) byBlock.set(t.block, []); byBlock.get(t.block)!.push(t) }
+  const nativeByTx = new Map<string, bigint>()
+  for (const [b, txs] of byBlock) {
+    const gasSum = txs.reduce((s, t) => s + (gasByTx.get(t.hash) || 0n), 0n)
+    const net = (balAt.get(b) || 0n) - (balAt.get(b - 1) || 0n) + gasSum
+    txs.forEach((t, i) => nativeByTx.set(t.hash, i === 0 ? net : 0n))
+  }
+
+  const lpTxs = lp.map((t) => ({ hash: t.hash, value: 0n, input: t.input, ts: tsByBlock.get(t.block) || 0 }))
+
+  // 4) symbols for every pair token (batched eth_call) — so closed-only pools show names
   const tokList = [...tokens].filter((t) => !isEthSide(t))
   const symRes = await batchCall(tokList.map((t) => ({ to: t, data: ERC20_SEL.symbol })))
   const symByTok = new Map<string, string>()
   tokList.forEach((t, i) => { const s = decodeSymbol(symRes[i]); if (s) symByTok.set(t, s) })
   for (const trs of transfersByTx.values()) for (const tr of trs) if (!tr.symbol && symByTok.has(tr.token)) tr.symbol = symByTok.get(tr.token)!
 
-  // 4) native ETH out (PoolManager → owner): only Blockscout has it. Best-effort, and
-  //    only for txs that actually pay native out (DECREASE/BURN); pure deposits get
-  //    their native side from tx.value already.
-  const internalsByTx = new Map<string, any[]>()
-  const needNative = lpTxs.filter((tx) => {
-    const a = lpActionsForTx(tx.input)
-    return a.some((x) => (x.action === ACT.DECREASE) || x.action === ACT.BURN)
-  })
-  let natFail = 0
-  const CONC = 12
-  for (let i = 0; i < needNative.length; i += CONC) {
-    const chunk = needNative.slice(i, i + CONC)
-    await Promise.all(chunk.map(async (tx) => {
-      const r = await bsRetry(`/transactions/${tx.hash}/internal-transactions`)
-      if (r == null) natFail++
-      internalsByTx.set(lc(tx.hash), (r?.items || []).filter((x: any) => lc(x.from?.hash) === PM || lc(x.to?.hash) === PM))
-    }))
-  }
-  return { lpTxs, transfersByTx, internalsByTx, complete: natFail === 0 }
+  return { lpTxs, transfersByTx, nativeByTx, complete: balList.every((b) => b != null) }
 }
 
 // Decode an ERC20 symbol() return (handles both string and bytes32 encodings).
@@ -250,8 +243,7 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
 }
 
 export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity, curvePrice: Map<string, bigint> = new Map()): WalletPnL {
-  const ownerLc = lc(owner)
-  const { lpTxs, transfersByTx, internalsByTx } = act
+  const { lpTxs, transfersByTx, nativeByTx } = act
   // price map: pair token → ETH per 1 token (raw/raw via sqrtPrice), from live pools
   const priceByToken = new Map<string, bigint>() // token → sqrtPriceX96
   const posByToken = new Map<string, Position[]>()
@@ -294,16 +286,10 @@ export function computeWalletPnL(owner: string, positions: Position[], act: LpAc
       const isRemove = acts.some((a) => (a.action === ACT.DECREASE && a.liquidity > 0n) || a.action === ACT.BURN)
       const isAdd = acts.some((a) => a.action === ACT.MINT || a.action === ACT.INCREASE)
 
-      // native ETH vs PoolManager
-      const it = internalsByTx.get(lc(tx.hash)) || []
-      let natIn = tx.value // native sent with the tx (deposit)
-      let natOut = 0n
-      for (const x of it) {
-        const f = lc(x.from?.hash || ''), t = lc(x.to?.hash || '')
-        const v = BigInt(x.value || '0')
-        if (f === PM && t === ownerLc) natOut += v
-        else if (t === PM && f === ownerLc) natIn += v
-      }
+      // net native ETH flow for the owner in this tx (balance-delta; + = received)
+      const net = nativeByTx.get(lc(tx.hash)) || 0n
+      const natIn = net < 0n ? -net : 0n  // net-sent native = deposit
+      const natOut = net > 0n ? net : 0n  // net-received native = withdraw/collect
 
       // ERC20 vs PoolManager → identify the pair token
       const trs = transfersByTx.get(lc(tx.hash)) || []
