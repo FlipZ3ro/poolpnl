@@ -50,5 +50,24 @@ export async function batchCall(calls: { to: string; data: string }[]): Promise<
   return Promise.all(calls.map((c) => rpc('eth_call', [{ to: c.to, data: c.data }, 'latest']).catch(() => null)))
 }
 
+/** Batched arbitrary JSON-RPC over one HTTP request (e.g. eth_getTransactionByHash,
+ *  eth_getBlockByNumber). Returns results in order; null for any that errored. */
+export async function batchRpc(reqs: { method: string; params: unknown[] }[]): Promise<(any | null)[]> {
+  if (!reqs.length) return []
+  try {
+    const body = reqs.map((r, i) => ({ jsonrpc: '2.0', id: i + 1, method: r.method, params: r.params }))
+    const res = await fetch(FETCH_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    if (res.ok) {
+      const arr = await res.json()
+      if (Array.isArray(arr)) {
+        const out = new Array(reqs.length).fill(null)
+        for (const r of arr) out[r.id - 1] = r.error ? null : r.result
+        return out
+      }
+    }
+  } catch { /* fall through */ }
+  return Promise.all(reqs.map((r) => rpc(r.method, r.params).catch(() => null)))
+}
+
 export const ethCall = (to: string, data: string) => rpc('eth_call', [{ to, data }, 'latest'])
 export const hexToBig = (h: string | null): bigint => (h && h !== '0x' ? BigInt(h) : 0n)

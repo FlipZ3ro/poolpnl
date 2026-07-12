@@ -13,14 +13,28 @@
 //      current price. Live open positions add exact current value + unclaimed fees.
 // Blockscout on this chain load-balances inconsistent indexers, so every fetch
 // retries and results are de-duplicated by hash.
-import { CHAIN, POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL } from './config'
+import { CHAIN, POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL, ERC20_SEL } from './config'
 import { Position, currency1ToEth } from './positions'
-import { batchCall, hexToBig } from './rpc'
+import { batchCall, batchRpc, rpc, hexToBig } from './rpc'
 
 const PM = lc(POOL_MANAGER)
 const WETHlc = lc(WETH)
 const isEthSide = (t: string) => t === WETHlc || /^0x0+$/.test(t)
 const E18 = 10n ** 18n
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+const topicAddr = (a: string) => '0x' + a.replace(/^0x/, '').toLowerCase().padStart(64, '0')
+
+// eth_getLogs over a block range, auto-splitting if the node rejects the span/size.
+async function getLogsSplit(topics: (string | null)[], from: number, to: number, depth = 0): Promise<any[]> {
+  try {
+    return await rpc('eth_getLogs', [{ fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics }])
+  } catch (e) {
+    if (from >= to || depth > 24) return []
+    const mid = Math.floor((from + to) / 2)
+    const [a, b] = await Promise.all([getLogsSplit(topics, from, mid, depth + 1), getLogsSplit(topics, mid + 1, to, depth + 1)])
+    return [...a, ...b]
+  }
+}
 
 // Query the launchpad bonding curve for the ETH price of each token (wei per whole
 // token). Tokens not on the curve return 0 → caller falls back to the V4 pool price.
@@ -43,24 +57,6 @@ async function bsRetry(path: string, tries = 6): Promise<any> {
   }
   return null
 }
-// Paginate, reporting whether we saw the full history. `complete` is false if a
-// page failed after all retries or we hit the cap with more pages remaining — so
-// callers never mistake a truncated fetch for "no more data".
-async function bsPagedC(path: string, cap = 40): Promise<{ items: any[]; complete: boolean }> {
-  const items: any[] = []
-  let np: any = null
-  let p = 0
-  for (; p < cap; p++) {
-    const sep = path.includes('?') ? '&' : '?'
-    const res = await bsRetry(np ? `${path}${sep}${new URLSearchParams(np)}` : path)
-    if (!res) return { items, complete: false } // a page genuinely failed → truncated
-    items.push(...(res.items || []))
-    np = res.next_page_params
-    if (!np) return { items, complete: true }   // natural end of history
-  }
-  return { items, complete: !np }               // hit cap: complete only if no more pages
-}
-
 // ---- modifyLiquidities calldata decode ---------------------------------------
 const SEL = 'dd46508f'
 const ACT = { INCREASE: 0x00, DECREASE: 0x01, MINT: 0x02, BURN: 0x03 }
@@ -150,57 +146,100 @@ export interface LpActivity {
   complete: boolean   // false if the indexer truncated the tx list or any per-tx fetch failed
 }
 
-// Fetch every Blockscout record PnL needs. Independent of on-chain position reads,
-// so the caller can run this in parallel with loadPositions() — the two slow,
-// unrelated phases (RPC reads ∥ indexer history) then overlap instead of stacking.
+// Reconstruct LP history primarily from eth_getLogs (reliable on this chain, unlike
+// the Blockscout indexer). Two log queries (ERC20 Transfers to/from the owner over
+// the full chain) give every token flow + the exact set of LP tx hashes in ~1s.
+// Per LP tx we then batch eth_getTransactionByHash (calldata to classify the action,
+// native value in) and eth_getBlockByNumber (timestamps). Native ETH *out* (V4 pays
+// native, which isn't logged and this node exposes no trace) is the one piece still
+// read from Blockscout internal-txns — best-effort, and only for LP txs.
 export async function fetchLpActivity(owner: string): Promise<LpActivity> {
-  // 1) find LP txs by scanning the owner's tx calldata for the modifyLiquidities
-  //    selector. This pagination is cursor-based (sequential) and unavoidable.
-  const { items: txItems, complete: txComplete } = await bsPagedC(`/addresses/${owner}/transactions?filter=from`, 40)
-  const seen = new Set<string>()
-  const lpTxs = txItems.filter((t) => {
-    const h = lc(t.hash); if (seen.has(h)) return false
-    const input = (t.raw_input || t.input || '').toLowerCase()
-    if (!input.includes(SEL)) return false
-    seen.add(h); return true
-  }).map((t) => ({
-    hash: t.hash as string,
-    value: BigInt(t.value || '0'),
-    input: (t.raw_input || t.input || '').toLowerCase(),
-    ts: Math.floor(new Date(t.timestamp).getTime() / 1000),
-  }))
+  const ot = topicAddr(owner)
+  const head = Number(hexToBig(await rpc('eth_blockNumber', []).catch(() => '0x0')))
+  if (!head) return { lpTxs: [], transfersByTx: new Map(), internalsByTx: new Map(), complete: false }
 
-  // 2) this chain's indexer is ~4s/request, so paging the full address token-transfer
-  //    history (many sequential pages) dominates. We only need transfers for the LP
-  //    txs, so fetch native (internal-txns) + ERC20 (token-transfers) PER LP TX and
-  //    fan out with bounded concurrency — turning N sequential pages into ~⌈2N/12⌉
-  //    parallel rounds.
+  // 1) all ERC20 transfers involving the owner (reliable, full history)
+  const [toLogs, fromLogs] = await Promise.all([
+    getLogsSplit([TRANSFER_TOPIC, null, ot], 0, head),
+    getLogsSplit([TRANSFER_TOPIC, ot, null], 0, head),
+  ])
   const transfersByTx = new Map<string, Transfer[]>()
+  const lpHashes = new Set<string>()
+  const seenLog = new Set<string>()
+  const tokens = new Set<string>()
+  for (const l of [...toLogs, ...fromLogs]) {
+    if (!l || !l.topics || l.topics.length < 3) continue
+    const key = lc(l.transactionHash) + ':' + l.logIndex
+    if (seenLog.has(key)) continue
+    seenLog.add(key)
+    const from = lc('0x' + l.topics[1].slice(26)), to = lc('0x' + l.topics[2].slice(26))
+    const tr: Transfer = { token: lc(l.address), symbol: '', from, to, value: hexToBig(l.data) }
+    const h = lc(l.transactionHash)
+    if (!transfersByTx.has(h)) transfersByTx.set(h, [])
+    transfersByTx.get(h)!.push(tr)
+    if (from === PM || to === PM) { lpHashes.add(h); tokens.add(tr.token) } // LP: PoolManager is the counterparty
+  }
+
+  // 2) calldata + native-in + block for each candidate LP tx (batched, reliable)
+  const hashes = [...lpHashes]
+  const txRes = await batchRpc(hashes.map((h) => ({ method: 'eth_getTransactionByHash', params: [h] })))
+  const blocks = new Set<number>()
+  const cand = hashes.map((h, i) => {
+    const t = txRes[i]; if (!t) return null
+    const block = Number(hexToBig(t.blockNumber))
+    blocks.add(block)
+    return { hash: h, value: hexToBig(t.value), input: (t.input || '').toLowerCase(), block, ts: 0 }
+  }).filter(Boolean) as { hash: string; value: bigint; input: string; block: number; ts: number }[]
+
+  const blkList = [...blocks]
+  const blkRes = await batchRpc(blkList.map((b) => ({ method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), false] })))
+  const tsByBlock = new Map<number, number>()
+  blkList.forEach((b, i) => { if (blkRes[i]) tsByBlock.set(b, Number(hexToBig(blkRes[i].timestamp))) })
+
+  // keep only true LP ops (modifyLiquidities selector present) — excludes swaps
+  const lpTxs = cand.filter((t) => t.input.includes(SEL)).map((t) => ({ hash: t.hash, value: t.value, input: t.input, ts: tsByBlock.get(t.block) || 0 }))
+
+  // 3) symbols for every pair token (batched eth_call) — so closed-only pools show names
+  const tokList = [...tokens].filter((t) => !isEthSide(t))
+  const symRes = await batchCall(tokList.map((t) => ({ to: t, data: ERC20_SEL.symbol })))
+  const symByTok = new Map<string, string>()
+  tokList.forEach((t, i) => { const s = decodeSymbol(symRes[i]); if (s) symByTok.set(t, s) })
+  for (const trs of transfersByTx.values()) for (const tr of trs) if (!tr.symbol && symByTok.has(tr.token)) tr.symbol = symByTok.get(tr.token)!
+
+  // 4) native ETH out (PoolManager → owner): only Blockscout has it. Best-effort, and
+  //    only for txs that actually pay native out (DECREASE/BURN); pure deposits get
+  //    their native side from tx.value already.
   const internalsByTx = new Map<string, any[]>()
-  let perTxFail = 0
+  const needNative = lpTxs.filter((tx) => {
+    const a = lpActionsForTx(tx.input)
+    return a.some((x) => (x.action === ACT.DECREASE) || x.action === ACT.BURN)
+  })
+  let natFail = 0
   const CONC = 12
-  for (let i = 0; i < lpTxs.length; i += CONC) {
-    const chunk = lpTxs.slice(i, i + CONC)
+  for (let i = 0; i < needNative.length; i += CONC) {
+    const chunk = needNative.slice(i, i + CONC)
     await Promise.all(chunk.map(async (tx) => {
-      const [intl, tt] = await Promise.all([
-        bsRetry(`/transactions/${tx.hash}/internal-transactions`),
-        bsRetry(`/transactions/${tx.hash}/token-transfers`),
-      ])
-      if (intl == null || tt == null) perTxFail++ // a leg failed after all retries → this tx's flow is incomplete
-      internalsByTx.set(lc(tx.hash), intl?.items || [])
-      const trs: Transfer[] = []
-      for (const x of (tt?.items || [])) {
-        trs.push({
-          token: lc(x.token?.address || x.token?.address_hash || ''),
-          symbol: x.token?.symbol || '',
-          from: lc(x.from?.hash || ''), to: lc(x.to?.hash || ''),
-          value: BigInt(x.total?.value || x.value || '0'),
-        })
-      }
-      transfersByTx.set(lc(tx.hash), trs)
+      const r = await bsRetry(`/transactions/${tx.hash}/internal-transactions`)
+      if (r == null) natFail++
+      internalsByTx.set(lc(tx.hash), (r?.items || []).filter((x: any) => lc(x.from?.hash) === PM || lc(x.to?.hash) === PM))
     }))
   }
-  return { lpTxs, transfersByTx, internalsByTx, complete: txComplete && perTxFail === 0 }
+  return { lpTxs, transfersByTx, internalsByTx, complete: natFail === 0 }
+}
+
+// Decode an ERC20 symbol() return (handles both string and bytes32 encodings).
+function decodeSymbol(hex: string | null): string {
+  if (!hex || hex === '0x') return ''
+  try {
+    const b = hex.slice(2)
+    const toStr = (h: string) => (h.match(/.{2}/g) || []).map((x) => parseInt(x, 16)).filter((c) => c > 0).map((c) => String.fromCharCode(c)).join('')
+    if (b.length === 64) { const s = toStr(b); return /^[\x20-\x7e]+$/.test(s) ? s : '' } // bytes32
+    const off = parseInt(b.slice(0, 64), 16) * 2
+    const len = parseInt(b.slice(off, off + 64), 16)
+    if (!len || len > 200) return ''
+    const s = toStr(b.slice(off + 64, off + 64 + len * 2))
+    return /^[\x20-\x7e]+$/.test(s) ? s : ''
+  } catch { return '' }
 }
 
 export async function loadWalletPnL(owner: string, positions: Position[]): Promise<WalletPnL> {
