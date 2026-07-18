@@ -1,12 +1,42 @@
 import { useState, useCallback } from 'react'
 import { CHAIN, isAddr } from './lib/config'
 import { loadPositions } from './lib/positions'
-import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL, LpActivity } from './lib/pnl'
+import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL, LpActivity, PoolPnL } from './lib/pnl'
 import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
 
 const EMPTY_ACTIVITY: LpActivity = { lpTxs: [], transfersByTx: new Map(), nativeByTx: new Map(), complete: true }
+
+export type CardStat = { label: string; value: string; kind: 'signed' | 'accent' | 'plain' }
+export interface CardModel { title: string; address: string; pnl: number; stats: CardStat[]; footer: string; slug: string }
+
+function walletCard(data: WalletPnL): CardModel {
+  const t = data.totals
+  return {
+    title: 'Uniswap V4 · Total PnL', address: data.address, pnl: t.pnl, slug: 'wallet',
+    stats: [
+      { label: 'Realized', value: signEth(t.realized), kind: 'signed' },
+      { label: 'Unrealized', value: signEth(t.unrealized), kind: 'signed' },
+      { label: 'Unclaimed fees', value: fmtEth(t.unclaimed), kind: 'accent' },
+      { label: 'Collected fees', value: fmtEth(t.collectedFees), kind: 'accent' },
+    ],
+    footer: `${t.open} open · ${t.closed} closed positions`,
+  }
+}
+function poolCard(data: WalletPnL, p: PoolPnL): CardModel {
+  const openPool = p.open > 0
+  return {
+    title: `ETH / ${p.symbol || 'token'}`, address: data.address, pnl: p.pnl, slug: (p.symbol || 'pool').toLowerCase(),
+    stats: [
+      { label: 'Deposited', value: fmtEth(p.cost), kind: 'plain' },
+      openPool ? { label: 'Current value', value: fmtEth(p.currentValue), kind: 'plain' } : { label: 'Withdrawn', value: fmtEth(p.withdrawn), kind: 'plain' },
+      { label: 'Unclaimed fees', value: fmtEth(p.unclaimed), kind: 'accent' },
+      { label: 'Collected fees', value: fmtEth(p.collectedFees), kind: 'accent' },
+    ],
+    footer: openPool ? `${p.open} open position${p.open > 1 ? 's' : ''} · ETH-native` : 'Closed position · ETH-native',
+  }
+}
 
 const short = (a: string) => a.slice(0, 6) + '…' + a.slice(-4)
 export const fmtEth = (n: number, dp = 4) => {
@@ -22,12 +52,12 @@ export default function App() {
   const [data, setData] = useState<WalletPnL | null>(null)
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [tab, setTab] = useState<'pools' | 'calendar'>('pools')
-  const [showCard, setShowCard] = useState(false)
+  const [card, setCard] = useState<CardModel | null>(null)
 
   const run = useCallback(async (address: string) => {
     const a = address.trim()
     if (!isAddr(a)) { setStatus('Enter a valid 0x address'); return }
-    setLoading(true); setData(null); setShowCard(false); setLoadingHistory(false)
+    setLoading(true); setData(null); setCard(null); setLoadingHistory(false)
     try {
       // Kick off the slow history fetch (indexer) in the background right away…
       const activityP = fetchLpActivity(a)
@@ -101,7 +131,7 @@ export default function App() {
           {/* address bar + share */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 26, marginBottom: 14 }}>
             <a href={`${CHAIN.explorer}/address/${data.address}`} target="_blank" rel="noreferrer" className="mono" style={{ fontSize: 13, color: 'var(--muted-2)' }}>{short(data.address)}</a>
-            <button onClick={() => setShowCard(true)} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--panel)', fontWeight: 600, fontSize: 13 }}>📸 Share PnL card</button>
+            <button onClick={() => setCard(walletCard(data))} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--panel)', fontWeight: 600, fontSize: 13 }}>📸 Share PnL card</button>
           </div>
 
           {loadingHistory && (
@@ -152,7 +182,7 @@ export default function App() {
             ))}
           </div>
 
-          {tab === 'pools' ? <Pools data={data} loadingHistory={loadingHistory} /> : <Calendar calendar={data.calendar} historyComplete={data.historyComplete} loadingHistory={loadingHistory} />}
+          {tab === 'pools' ? <Pools data={data} loadingHistory={loadingHistory} onShare={(p) => setCard(poolCard(data, p))} /> : <Calendar calendar={data.calendar} historyComplete={data.historyComplete} loadingHistory={loadingHistory} />}
         </div>
       )}
 
@@ -164,7 +194,7 @@ export default function App() {
         </div>
       )}
 
-      {showCard && data && <ShareCard data={data} onClose={() => setShowCard(false)} />}
+      {card && <ShareCard card={card} onClose={() => setCard(null)} />}
     </div>
   )
 }

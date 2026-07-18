@@ -2,12 +2,12 @@ import { CHAIN } from './lib/config'
 import { WalletPnL, PoolPnL } from './lib/pnl'
 import { fmtEth, signEth } from './App'
 
-export function Pools({ data, loadingHistory }: { data: WalletPnL; loadingHistory?: boolean }) {
+export function Pools({ data, loadingHistory, onShare }: { data: WalletPnL; loadingHistory?: boolean; onShare?: (p: PoolPnL) => void }) {
   // While history loads we only know live pools; hide closed-only + history fields.
   const rows = loadingHistory ? data.pools.filter((p) => p.open > 0 || p.currentValue > 1e-9) : data.pools
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-      {rows.map((p) => <Row key={p.token || 'eth'} p={p} loadingHistory={loadingHistory} />)}
+      {rows.map((p) => <Row key={p.token || 'eth'} p={p} loadingHistory={loadingHistory} onShare={onShare} />)}
       {data.approx && !loadingHistory && (
         <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
           * Pools without a live position are priced ETH-side only; PnL there is approximate.
@@ -17,7 +17,7 @@ export function Pools({ data, loadingHistory }: { data: WalletPnL; loadingHistor
   )
 }
 
-function Row({ p, loadingHistory }: { p: PoolPnL; loadingHistory?: boolean }) {
+function Row({ p, loadingHistory, onShare }: { p: PoolPnL; loadingHistory?: boolean; onShare?: (p: PoolPnL) => void }) {
   const openBadge = p.open > 0
   return (
     <div style={{ padding: '14px 16px', borderRadius: 13, border: '1px solid var(--border)', background: 'var(--panel)' }}>
@@ -29,7 +29,13 @@ function Row({ p, loadingHistory }: { p: PoolPnL; loadingHistory?: boolean }) {
             : <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', background: 'var(--border-soft)', padding: '2px 9px', borderRadius: 20 }}>closed</span>}
           {!p.hasPrice && <span title="Priced ETH-side only" style={{ fontSize: 11, color: 'var(--amber)' }}>~approx</span>}
         </div>
-        {p.token && <a href={`${CHAIN.explorer}/token/${p.token}`} target="_blank" rel="noreferrer" className="mono" style={{ fontSize: 11.5, color: 'var(--muted)' }}>{p.token.slice(0, 6)}…</a>}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {p.token && <a href={`${CHAIN.explorer}/token/${p.token}`} target="_blank" rel="noreferrer" className="mono" style={{ fontSize: 11.5, color: 'var(--muted)' }}>{p.token.slice(0, 6)}…</a>}
+          {!loadingHistory && p.token && onShare && (
+            <button onClick={() => onShare(p)} title="Share this pool's PnL card"
+              style={{ fontSize: 12.5, padding: '3px 9px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--panel-2)', fontWeight: 600 }}>📸</button>
+          )}
+        </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginTop: 11, gap: 12, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', gap: 18, fontSize: 12, color: 'var(--muted-2)', flexWrap: 'wrap' }}>

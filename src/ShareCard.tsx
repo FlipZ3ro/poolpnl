@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react'
 import { toPng } from 'html-to-image'
-import { WalletPnL } from './lib/pnl'
-import { fmtEth, signEth } from './App'
+import { signEth, CardModel, CardStat } from './App'
 
 const THEMES = [
   { name: 'Aqua', bg: 'linear-gradient(145deg,#0b2a2e,#08131a 55%,#0a1f2e)', glow: '#5eead4' },
@@ -33,7 +32,7 @@ function funLine(pnl: number): string {
   return win ? 'Absolute unit. Whale mode 🐋' : 'That’s a story for the group chat 🫠'
 }
 
-export function ShareCard({ data, onClose }: { data: WalletPnL; onClose: () => void }) {
+export function ShareCard({ card, onClose }: { card: CardModel; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const imgInput = useRef<HTMLInputElement>(null)
@@ -43,10 +42,10 @@ export function ShareCard({ data, onClose }: { data: WalletPnL; onClose: () => v
   const [bgImage, setBgImage] = useState<string | null>(() => { try { return localStorage.getItem('poolpnl_bg') } catch { return null } })
   const [bgVideo, setBgVideo] = useState<string | null>(null)
   const [capturing, setCapturing] = useState(false) // hide bg media → render content on transparency
-  const t = data.totals
   const th = THEMES[theme]
   const hasBg = !!(bgImage || bgVideo)
-  const win = t.pnl >= 0
+  const win = card.pnl >= 0
+  const fileBase = `poolpnl-${card.slug}-${short(card.address)}`
 
   const pickImage = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]; if (!f) return
@@ -86,7 +85,7 @@ export function ShareCard({ data, onClose }: { data: WalletPnL; onClose: () => v
 
   const save = async () => {
     setBusy('save')
-    try { const url = await renderPng(); if (!url) return; const a = document.createElement('a'); a.href = url; a.download = `poolpnl-${short(data.address)}.png`; a.click() }
+    try { const url = await renderPng(); if (!url) return; const a = document.createElement('a'); a.href = url; a.download = `${fileBase}.png`; a.click() }
     finally { setBusy('') }
   }
   const copy = async () => {
@@ -128,7 +127,7 @@ export function ShareCard({ data, onClose }: { data: WalletPnL; onClose: () => v
       draw()
       await stopped
       const blob = new Blob(chunks, { type: 'video/webm' })
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `poolpnl-${short(data.address)}.webm`; a.click()
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${fileBase}.webm`; a.click()
     } finally { setBusy('') }
   }
 
@@ -150,27 +149,24 @@ export function ShareCard({ data, onClose }: { data: WalletPnL; onClose: () => v
               <div style={{ width: 26, height: 26, borderRadius: 7, background: `linear-gradient(135deg,${th.glow},#3b82f6)`, display: 'grid', placeItems: 'center', fontWeight: 800, color: '#08131a', fontSize: 14 }}>P</div>
               <span style={{ fontWeight: 800, fontSize: 15, color: '#fff' }}>PoolPnL</span>
             </div>
-            <span className="mono" style={{ fontSize: 12, color: 'rgba(255,255,255,.7)' }}>{short(data.address)}</span>
+            <span className="mono" style={{ fontSize: 12, color: 'rgba(255,255,255,.7)' }}>{short(card.address)}</span>
           </div>
 
           <div style={{ marginTop: 30, position: 'relative' }}>
-            <div style={{ fontSize: 12, letterSpacing: 1.5, textTransform: 'uppercase', color: 'rgba(255,255,255,.6)', fontWeight: 600 }}>Uniswap V4 Total PnL</div>
+            <div style={{ fontSize: 12, letterSpacing: 1.5, textTransform: 'uppercase', color: 'rgba(255,255,255,.6)', fontWeight: 600 }}>{card.title}</div>
             <div style={{ fontSize: 58, fontWeight: 800, letterSpacing: -2, marginTop: 6, fontFamily: 'var(--font-mono)', color: win ? '#4ade80' : '#f87171', lineHeight: 1, textShadow: hasBg ? '0 2px 18px rgba(0,0,0,.5)' : 'none' }}>
-              {signEth(t.pnl)}
+              {signEth(card.pnl)}
             </div>
             <div style={{ fontSize: 17, fontWeight: 700, color: 'rgba(255,255,255,.85)', marginTop: 2 }}>ETH</div>
-            <div style={{ marginTop: 12, fontSize: 14, color: 'rgba(255,255,255,.8)', fontWeight: 500 }}>{funLine(t.pnl)}</div>
+            <div style={{ marginTop: 12, fontSize: 14, color: 'rgba(255,255,255,.8)', fontWeight: 500 }}>{funLine(card.pnl)}</div>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 26, position: 'relative' }}>
-            <Cell label="Realized" v={signEth(t.realized)} pos={t.realized >= 0} glass={hasBg} />
-            <Cell label="Unrealized" v={signEth(t.unrealized)} pos={t.unrealized >= 0} glass={hasBg} />
-            <Cell label="Unclaimed fees" v={fmtEth(t.unclaimed)} glow={th.glow} glass={hasBg} />
-            <Cell label="Collected fees" v={fmtEth(t.collectedFees)} glow={th.glow} glass={hasBg} />
+            {card.stats.map((s) => <Cell key={s.label} stat={s} glow={th.glow} glass={hasBg} />)}
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 24, fontSize: 12, color: 'rgba(255,255,255,.6)', position: 'relative' }}>
-            <span>{t.open} open · {t.closed} closed positions</span>
+            <span>{card.footer}</span>
             <span>Robinhood Chain · Uniswap V4</span>
           </div>
         </div>
@@ -207,11 +203,14 @@ function roundClip(ctx: CanvasRenderingContext2D, W: number, H: number, r: numbe
   ctx.closePath(); ctx.clip()
 }
 
-function Cell({ label, v, pos, glow, glass }: { label: string; v: string; pos?: boolean; glow?: string; glass?: boolean }) {
+function Cell({ stat, glow, glass }: { stat: CardStat; glow?: string; glass?: boolean }) {
+  const color = stat.kind === 'accent' ? glow
+    : stat.kind === 'signed' ? (stat.value.startsWith('−') ? '#f87171' : '#4ade80')
+    : 'rgba(255,255,255,.92)'
   return (
     <div style={{ padding: '12px 14px', borderRadius: 12, background: glass ? 'rgba(8,14,22,.42)' : 'rgba(255,255,255,.05)', border: '1px solid rgba(255,255,255,.09)', backdropFilter: glass ? 'blur(3px)' : undefined }}>
-      <div style={{ fontSize: 11, color: 'rgba(255,255,255,.6)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>{label}</div>
-      <div style={{ fontSize: 18, fontWeight: 800, marginTop: 4, fontFamily: 'var(--font-mono)', color: glow ? glow : pos ? '#4ade80' : '#f87171' }}>{v}<span style={{ fontSize: 11, opacity: 0.6, marginLeft: 3 }}>ETH</span></div>
+      <div style={{ fontSize: 11, color: 'rgba(255,255,255,.6)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>{stat.label}</div>
+      <div style={{ fontSize: 18, fontWeight: 800, marginTop: 4, fontFamily: 'var(--font-mono)', color }}>{stat.value}<span style={{ fontSize: 11, opacity: 0.6, marginLeft: 3 }}>ETH</span></div>
     </div>
   )
 }
