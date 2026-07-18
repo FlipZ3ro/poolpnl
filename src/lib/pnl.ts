@@ -194,17 +194,31 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
     batchRpc(blkTs.map((b) => ({ method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), false] }))),
     batchRpc(lp.filter((t) => t.from === ownerLc).map((t) => ({ method: 'eth_getTransactionReceipt', params: [t.hash] }))),
   ])
-  const balAt = new Map<number, bigint>(); [...need].forEach((b, i) => balAt.set(b, hexToBig(balList[i])))
+  // Only trust balances that actually came back — a failed/garbage eth_getBalance must
+  // NOT be read as 0 (that yields a bogus, often astronomically wrong, delta).
+  const needArr = [...need]
+  const balAt = new Map<number, bigint>()
+  needArr.forEach((b, i) => { const v = balList[i]; if (v != null && v !== '0x') balAt.set(b, BigInt(v)) })
+  // the RPC intermittently drops eth_getBalance — retry the misses a couple of times
+  let missing = needArr.filter((b) => !balAt.has(b))
+  for (let a = 0; a < 2 && missing.length; a++) {
+    const res = await batchRpc(missing.map((b) => ({ method: 'eth_getBalance', params: [owner, '0x' + b.toString(16)] })))
+    missing.forEach((b, i) => { const v = res[i]; if (v != null && v !== '0x') balAt.set(b, BigInt(v)) })
+    missing = missing.filter((b) => !balAt.has(b))
+  }
+  const balFail = missing.length
   const tsByBlock = new Map<number, number>(); blkTs.forEach((b, i) => { if (tsRes[i]) tsByBlock.set(b, Number(hexToBig(tsRes[i].timestamp))) })
   const gasByTx = new Map<string, bigint>()
   lp.filter((t) => t.from === ownerLc).forEach((t, i) => { const rc = rcRes[i]; if (rc) gasByTx.set(t.hash, hexToBig(rc.gasUsed) * hexToBig(rc.effectiveGasPrice || '0x0')) })
   // one balance delta per block (attribute to the block's first LP tx to avoid double-count)
+  const SANE = 10n ** 24n // 1,000,000 ETH — any bigger single-tx native flow is a fetch glitch
   const byBlock = new Map<number, typeof lp>()
   for (const t of lp) { if (!byBlock.has(t.block)) byBlock.set(t.block, []); byBlock.get(t.block)!.push(t) }
   const nativeByTx = new Map<string, bigint>()
   for (const [b, txs] of byBlock) {
-    const gasSum = txs.reduce((s, t) => s + (gasByTx.get(t.hash) || 0n), 0n)
-    const net = (balAt.get(b) || 0n) - (balAt.get(b - 1) || 0n) + gasSum
+    // both endpoints must be known, else we can't compute a real delta → treat native as 0
+    let net = (balAt.has(b) && balAt.has(b - 1)) ? balAt.get(b)! - balAt.get(b - 1)! + txs.reduce((s, t) => s + (gasByTx.get(t.hash) || 0n), 0n) : 0n
+    if (net > SANE || net < -SANE) net = 0n
     txs.forEach((t, i) => nativeByTx.set(t.hash, i === 0 ? net : 0n))
   }
 
@@ -217,7 +231,7 @@ export async function fetchLpActivity(owner: string): Promise<LpActivity> {
   tokList.forEach((t, i) => { const s = decodeSymbol(symRes[i]); if (s) symByTok.set(t, s) })
   for (const trs of transfersByTx.values()) for (const tr of trs) if (!tr.symbol && symByTok.has(tr.token)) tr.symbol = symByTok.get(tr.token)!
 
-  return { lpTxs, transfersByTx, nativeByTx, complete: balList.every((b) => b != null) }
+  return { lpTxs, transfersByTx, nativeByTx, complete: balFail === 0 }
 }
 
 // Decode an ERC20 symbol() return (handles both string and bytes32 encodings).
@@ -258,13 +272,15 @@ export function computeWalletPnL(owner: string, positions: Position[], act: LpAc
   }
   // Value a raw token amount in ETH. Preference: bonding-curve price (accurate for
   // launchpad tokens still on the curve) → V4 pool price → unpriced.
+  const sane = (eth: number, priced: boolean): { eth: number; priced: boolean } =>
+    (!Number.isFinite(eth) || Math.abs(eth) > 1e6) ? { eth: 0, priced: false } : { eth, priced }
   const tokenToEth = (token: string, amt: bigint): { eth: number; priced: boolean } => {
-    if (isEthSide(token)) return { eth: wei(amt), priced: true }
+    if (isEthSide(token)) return sane(wei(amt), true)
     const cp = curvePrice.get(token) // wei ETH per whole token (18-dec launchpad tokens)
-    if (cp) return { eth: Number((amt * cp) / E18) / 1e18, priced: true }
+    if (cp) return sane(Number((amt * cp) / E18) / 1e18, true)
     const sp = priceByToken.get(token)
     if (!sp) return { eth: 0, priced: false }
-    return { eth: currency1ToEth(amt, sp) / 1e18, priced: true }
+    return sane(currency1ToEth(amt, sp) / 1e18, true)
   }
 
   // classify + aggregate per pool
