@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import { CHAIN, isAddr } from './lib/config'
 import { loadPositions } from './lib/positions'
-import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, WalletPnL, LpActivity, PoolPnL } from './lib/pnl'
+import { fetchLpActivity, computeWalletPnL, resolveCurvePrices, resolvePoolSqrtPrices, WalletPnL, LpActivity, PoolPnL } from './lib/pnl'
 import { ShareCard } from './ShareCard'
 import { Calendar } from './Calendar'
 import { Pools } from './Pools'
@@ -79,7 +79,9 @@ export default function App() {
       if (!positions.length && !activity.lpTxs.length) { setStatus('No Uniswap V4 positions or LP activity found for this address.'); return }
       const toks = [...positions.flatMap((p) => [p.token0.address, p.token1.address]), ...[...activity.transfersByTx.values()].flat().map((t) => t.token)]
       const curve = await resolveCurvePrices(toks)
-      setData(computeWalletPnL(a, positions, activity, curve))
+      // price non-curve tokens (USDG stable, graduated tokens) from their ETH/token pool
+      const poolSqrt = await resolvePoolSqrtPrices(toks.filter((t) => !curve.has(t.toLowerCase())))
+      setData(computeWalletPnL(a, positions, activity, curve, poolSqrt))
       setStatus('')
     } catch (e: any) {
       setStatus('Error: ' + (e?.message || e))

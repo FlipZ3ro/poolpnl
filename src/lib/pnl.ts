@@ -13,8 +13,8 @@
 //      current price. Live open positions add exact current value + unclaimed fees.
 // Blockscout on this chain load-balances inconsistent indexers, so every fetch
 // retries and results are de-duplicated by hash.
-import { POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL, ERC20_SEL } from './config'
-import { Position, currency1ToEth } from './positions'
+import { POOL_MANAGER, lc, WETH, BONDING_CURVE, CURVE_SEL, ERC20_SEL, V4, SV_SEL, NATIVE } from './config'
+import { Position, PoolKey, currency1ToEth, derivePoolId } from './positions'
 import { batchCall, batchRpc, rpc, hexToBig } from './rpc'
 
 const PM = lc(POOL_MANAGER)
@@ -45,6 +45,47 @@ export async function resolveCurvePrices(tokens: string[]): Promise<Map<string, 
   const padAddr = (a: string) => a.replace(/^0x/, '').padStart(64, '0')
   const res = await batchCall(uniq.map((t) => ({ to: BONDING_CURVE, data: CURVE_SEL.currentPrice + padAddr(t) })))
   res.forEach((r, i) => { const v = hexToBig(r); if (v > 0n) out.set(uniq[i], v) })
+  return out
+}
+
+// (fee, tickSpacing) candidates for ETH/token V4 pools — the AEON launch series
+// (tickSpacing = fee/50) plus standard Uniswap tiers.
+const FEE_TIERS: [number, number][] = [
+  [5000, 100], [10000, 200], [25000, 500], [50000, 1000], [100000, 2000], [150000, 3000],
+  [200000, 4000], [250000, 5000], [300000, 6000], [400000, 8000], [500000, 10000], [650000, 13000],
+  [800000, 16000], [1000000, 20000], [100, 1], [500, 10], [2500, 50], [3000, 60],
+]
+
+const GET_LIQUIDITY = '0xfa6793d5' // StateView.getLiquidity(bytes32)
+
+// For tokens with no live position and not on the bonding curve (e.g. USDG stable,
+// graduated tokens), price the ETH/token pool directly: derive candidate poolIds,
+// read getSlot0 + getLiquidity, and take the DEEPEST live pool per token (thin pools
+// carry skewed prices). Returns token → sqrtPriceX96.
+export async function resolvePoolSqrtPrices(tokens: string[]): Promise<Map<string, bigint>> {
+  const uniq = [...new Set(tokens.map(lc).filter((t) => t && !isEthSide(t)))]
+  const out = new Map<string, bigint>()
+  if (!uniq.length) return out
+  const cand: { token: string; poolId: string }[] = []
+  for (const token of uniq) for (const [fee, tickSpacing] of FEE_TIERS) {
+    const key: PoolKey = { currency0: NATIVE as any, currency1: token as any, fee, tickSpacing, hooks: NATIVE as any }
+    cand.push({ token, poolId: derivePoolId(key) })
+  }
+  const res = await batchCall(cand.flatMap((c) => [
+    { to: V4.stateView, data: SV_SEL.getSlot0 + c.poolId.slice(2) },
+    { to: V4.stateView, data: GET_LIQUIDITY + c.poolId.slice(2) },
+  ]))
+  const best = new Map<string, { liq: bigint; sqrt: bigint }>()
+  cand.forEach((c, i) => {
+    const s0 = res[i * 2], lq = res[i * 2 + 1]
+    if (!s0 || s0 === '0x') return
+    const sqrt = BigInt('0x' + s0.slice(2, 66))
+    if (sqrt === 0n) return
+    const liq = hexToBig(lq)
+    const cur = best.get(c.token)
+    if (!cur || liq > cur.liq) best.set(c.token, { liq, sqrt })
+  })
+  for (const [token, b] of best) out.set(token, b.sqrt)
   return out
 }
 
@@ -253,19 +294,21 @@ export async function loadWalletPnL(owner: string, positions: Position[]): Promi
   const act = await fetchLpActivity(owner)
   const toks = [...positions.flatMap((p) => [p.token0.address, p.token1.address]), ...[...act.transfersByTx.values()].flat().map((t) => t.token)]
   const curve = await resolveCurvePrices(toks)
-  return computeWalletPnL(owner, positions, act, curve)
+  const poolSqrt = await resolvePoolSqrtPrices(toks.filter((t) => !curve.has(lc(t))))
+  return computeWalletPnL(owner, positions, act, curve, poolSqrt)
 }
 
-export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity, curvePrice: Map<string, bigint> = new Map()): WalletPnL {
+export function computeWalletPnL(owner: string, positions: Position[], act: LpActivity, curvePrice: Map<string, bigint> = new Map(), poolSqrt: Map<string, bigint> = new Map()): WalletPnL {
   const { lpTxs, transfersByTx, nativeByTx } = act
   // price map: pair token → ETH per 1 token (raw/raw via sqrtPrice), from live pools
   const priceByToken = new Map<string, bigint>() // token → sqrtPriceX96
+  for (const [tok, sp] of poolSqrt) priceByToken.set(lc(tok), sp) // ETH/token pool prices (USDG, graduated tokens)
   const posByToken = new Map<string, Position[]>()
   const symByToken = new Map<string, string>()
   for (const p of positions) {
     const pair = isEthSide(lc(p.token0.address)) ? lc(p.token1.address) : lc(p.token0.address)
     const pairMeta = isEthSide(lc(p.token0.address)) ? p.token1 : p.token0
-    if (p.sqrtPriceX96 > 0n) priceByToken.set(pair, p.sqrtPriceX96)
+    if (p.sqrtPriceX96 > 0n) priceByToken.set(pair, p.sqrtPriceX96) // live position price wins
     symByToken.set(pair, pairMeta.symbol)
     if (!posByToken.has(pair)) posByToken.set(pair, [])
     posByToken.get(pair)!.push(p)
